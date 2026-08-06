@@ -1,0 +1,24 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+.env
+*.log
+
+# generated artifacts (regenerable via run_*.py)
+data/*.db
+data/*.db-shm
+data/*.db-wal
+data/_probe*.json
+data/_tmp*.json
+data/monitor_alerts.json
+data/backtest_equity.csv
+data/backtest_report.json
+data/paper_report.json
+data/live_report.json
+data/validation_report.json
+data/learning_report.json
+data/reports/
+
+journal.db
+
