@@ -1,0 +1,61 @@
+{
+  "mode": "backtest",
+  "quote": "USDT",
+  "market_type": "futures",
+  "leverage": 3,
+  "watchlist": [
+    "BTC", "ETH", "SOL", "BNB", "XRP", "DOGE", "LINK", "ADA",
+    "AVAX", "SUI", "ARB", "OP", "PEPE", "SHIB"
+  ],
+  "timeframes": ["5m", "15m", "1h", "4h", "1d"],
+  "trade_timeframe": "1h",
+  "trend_timeframes": ["1h", "4h", "1d"],
+  "confidence_timeframes": ["15m", "1h", "4h"],
+  "max_data_bars": { "1m": 1000, "5m": 1000, "15m": 1000, "1h": 1000, "4h": 1000, "1d": 1000 },
+  "risk": {
+    "per_trade": 0.01,
+    "daily": 0.03,
+    "weekly": 0.06,
+    "monthly": 0.10,
+    "max_positions": 5,
+    "max_coin_weight": 0.25,
+    "max_correlated_weight": 0.50,
+    "kelly_fraction": 0.25,
+    "kelly_cap_pct": 0.25,
+    "atr_mult_sl": 1.5,
+    "min_rr": 3.0,
+    "min_confidence": 0.70,
+    "max_hold_hours": 48,
+    "emergency_exit_atr_mult": 6.0,
+    "circuit_breaker": { "daily": 3, "weekly": 6, "monthly": 10 }
+  },
+  "exit": {
+    "breakeven_after_rr": 1.0,
+    "trail_start_rr": 1.5,
+    "trail_atr_mult": 2.0,
+    "partials": [
+      { "fraction": 0.33, "rr": 1.0 },
+      { "fraction": 0.33, "rr": 2.0 }
+    ]
+  },
+  "fees": {
+    "futures_taker": 0.0005,
+    "spot_taker": 0.0010,
+    "slippage_bps": 5
+  },
+  "news": {
+    "blackout_hours": 2,
+    "high_impact_events": ["FOMC", "CPI", "NFP", "ECB", "BOC", "BOJ"],
+    "post_event_scan_minutes": 30
+  },
+  "learning": {
+    "enabled": true,
+    "buffer_size": 300
+  },
+  "backtest": {
+    "start": null,
+    "end": null,
+    "initial_capital": 10000.0,
+    "bars": 1500
+  }
+}
