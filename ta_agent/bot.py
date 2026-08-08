@@ -82,7 +82,14 @@ class TradingBot:
         data/indicators without trading (used at startup). ``on_cycle``, when
         given, is called with ``(store, settings)`` every ``report_every``
         cycles so external processes can refresh reports while running."""
-        coins = self.feed.available_coins() if not self.s.is_backtest() else self.s.watchlist
+        if self.s.is_backtest():
+            coins = list(self.s.watchlist)
+        else:
+            try:
+                coins = self.feed.available_coins()
+            except Exception as exc:
+                log.warning("available_coins() failed (%s); falling back to watchlist", exc)
+                coins = list(self.s.watchlist)
         log.info("Bot starting | mode=%s | coins=%s | trade_tf=%s | min_confidence=%.0f%%",
                  self.s.mode, coins, self.s.trade_timeframe, self.s.min_confidence * 100)
         self._sync_equity()

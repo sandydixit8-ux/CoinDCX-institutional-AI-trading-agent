@@ -153,3 +153,31 @@ class TestZeroEquityDrawdown:
         alerts = mon.check_drawdown(bot.risk.state)
         assert any(a["rule"] == "drawdown_limit" and a["severity"] == "critical"
                    for a in alerts)
+
+
+class TestAvailableCoinsFallback:
+    """A transient network failure in available_coins() (a raw CoinDCX HTTP GET
+    at the start of every bot loop) must fall back to the watchlist, not crash
+    the daemon into a restart loop."""
+
+    def test_failure_falls_back_to_watchlist(self, settings, tmp_path, monkeypatch):
+        from ta_agent.coindcx_client import CoinDCXError
+        bot = TradingBot(settings, store_path=tmp_path / "j.db", synthetic=True)
+
+        def boom(self):
+            raise CoinDCXError("simulated network failure in available_coins")
+
+        monkeypatch.setattr(type(bot.feed), "available_coins", boom)
+        bot.run(cycles=1, interval_seconds=0, dry_cycles=1)  # must not raise
+
+    def test_success_uses_available_coins(self, settings, tmp_path, monkeypatch, caplog):
+        bot = TradingBot(settings, store_path=tmp_path / "j.db", synthetic=True)
+        called = {"n": 0}
+
+        def counting(self):
+            called["n"] += 1
+            return ["BTC"]
+
+        monkeypatch.setattr(type(bot.feed), "available_coins", counting)
+        bot.run(cycles=1, interval_seconds=0, dry_cycles=1)
+        assert called["n"] == 1, "available_coins() should be consulted on success"
