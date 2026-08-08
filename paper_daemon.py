@@ -28,21 +28,24 @@ from ta_agent.settings import Settings
 _MUTEX_NAME = "Global\\TradingAgentPaperDaemonMutex"
 
 
-def _acquire_single_instance():
+def _acquire_single_instance(instance: str = "paper_daemon"):
     """Refuse to start if another daemon is already running, so two bots can
     never write the same journal concurrently. A named mutex is atomic and the
     OS releases it when the holding process exits (or dies), so no stale locks
-    can block restarts."""
+    can block restarts. The ``instance`` names the mutex, so multiple daemons
+    can run in parallel (one per practice profile) as long as each uses a
+    distinct instance + data directory."""
     import ctypes
     from ctypes import wintypes
 
+    mutex_name = f"Global\\TradingAgent{instance}Mutex"
     kernel32 = ctypes.windll.kernel32
     kernel32.CreateMutexW.restype = wintypes.HANDLE
-    handle = kernel32.CreateMutexW(None, True, _MUTEX_NAME)
+    handle = kernel32.CreateMutexW(None, True, mutex_name)
     if not handle:
         sys.exit("failed to create mutex - exiting")
     if kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
-        sys.exit("paper_daemon already running - exiting")
+        sys.exit(f"paper_daemon [{instance}] already running - exiting")
     return handle
 
 
@@ -67,9 +70,13 @@ def main() -> int:
     parser.add_argument("--max-restarts", type=int, default=20,
                         help="give up after this many consecutive crashes")
     parser.add_argument("--config", default="config.json")
+    parser.add_argument("--instance", default="paper_daemon",
+                        help="unique name for this daemon instance (mutex + journal + log)")
+    parser.add_argument("--data-dir", default=None,
+                        help="override data directory (keeps parallel instances isolated)")
     args = parser.parse_args()
 
-    log_file = Path("data") / "paper_daemon.log"
+    log_file = Path(args.data_dir or "data") / f"{args.instance}.log"
     log_file.parent.mkdir(parents=True, exist_ok=True)
     handler = RotatingFileHandler(log_file, maxBytes=5_000_000,
                                   backupCount=3, encoding="utf-8")
@@ -77,10 +84,12 @@ def main() -> int:
                         handlers=[handler])
     log = logging.getLogger("paper_daemon")
 
-    lock = _acquire_single_instance()
+    lock = _acquire_single_instance(args.instance)
 
     s = Settings.load(args.config)
     s.mode = "paper"
+    if args.data_dir:
+        s.data_dir = args.data_dir
 
     restarts = 0
     cycles_so_far = 0
