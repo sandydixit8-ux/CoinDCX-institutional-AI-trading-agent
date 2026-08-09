@@ -1,6 +1,7 @@
 """SQLite persistence: trade journal, equity curve, learned parameters."""
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import time
@@ -42,6 +43,14 @@ class TradeStore:
             CREATE TABLE IF NOT EXISTS monitor_alerts (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 ts INTEGER, severity TEXT, rule TEXT, detail TEXT, meta TEXT
+            );
+            CREATE TABLE IF NOT EXISTS ledger (
+                seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts INTEGER,
+                event TEXT,
+                prev_hash TEXT,
+                payload TEXT,
+                hash TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_trades_time ON trades(entry_time);
             CREATE INDEX IF NOT EXISTS idx_equity_ts ON equity(ts);
@@ -165,6 +174,47 @@ class TradeStore:
     def equity_curve(self) -> List[Dict]:
         rows = self.conn.execute("SELECT ts, equity, peak, drawdown FROM equity ORDER BY ts").fetchall()
         return [dict(r) for r in rows]
+
+    # ------------------------------------------------------------------
+    # Hash-chained audit ledger
+    # ------------------------------------------------------------------
+    def _ledger_head_hash(self) -> str:
+        row = self.conn.execute("SELECT hash FROM ledger ORDER BY seq DESC LIMIT 1").fetchone()
+        return row["hash"] if row else "GENESIS"
+
+    @staticmethod
+    def _ledger_hash(prev_hash: str, ts: int, event: str, payload: str) -> str:
+        return hashlib.sha256(f"{prev_hash}|{ts}|{event}|{payload}".encode("utf-8")).hexdigest()
+
+    def append_ledger(self, event: str, payload: dict) -> dict:
+        """Append a tamper-evident entry: each row's hash covers the previous
+        row's hash plus this event's payload, forming a hash chain."""
+        ts = int(time.time() * 1000)
+        prev = self._ledger_head_hash()
+        payload_str = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        digest = self._ledger_hash(prev, ts, event, payload_str)
+        self.conn.execute(
+            "INSERT INTO ledger (ts, event, prev_hash, payload, hash) VALUES (?,?,?,?,?)",
+            (ts, event, prev, payload_str, digest))
+        self.conn.commit()
+        return {"seq": self.conn.execute("SELECT seq FROM ledger ORDER BY seq DESC LIMIT 1").fetchone()[0],
+                "ts": ts, "event": event, "prev_hash": prev, "payload": payload_str, "hash": digest}
+
+    def ledger_tail(self, limit: int = 100) -> List[sqlite3.Row]:
+        return self.conn.execute(
+            "SELECT * FROM ledger ORDER BY seq DESC LIMIT ?", (limit,)).fetchall()
+
+    def verify_ledger(self) -> dict:
+        """Recompute the chain and report the first broken link, if any."""
+        rows = self.conn.execute("SELECT * FROM ledger ORDER BY seq").fetchall()
+        expected = "GENESIS"
+        for r in rows:
+            recomputed = self._ledger_hash(expected, r["ts"], r["event"], r["payload"])
+            if recomputed != r["hash"] or r["prev_hash"] != expected:
+                return {"ok": False, "entries": len(rows),
+                        "first_broken_seq": r["seq"]}
+            expected = r["hash"]
+        return {"ok": True, "entries": len(rows), "head": expected}
 
     # ------------------------------------------------------------------
     def set_param(self, key: str, value) -> None:

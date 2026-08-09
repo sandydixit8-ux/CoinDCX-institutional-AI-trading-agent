@@ -68,6 +68,8 @@ class TradingBot:
         self.open_positions: Dict[str, PositionState] = {}
         self._close_counter = 0
         self._consecutive_errors = 0
+        self._stale_cycles = 0
+        self._auto_paused = False
         self._last_plans: list = []
         self._last_event_risk = None
         self._equity_synced = False
@@ -97,22 +99,48 @@ class TradingBot:
         warm = 0
         while cycles is None or cycle < cycles:
             marker = self._check_markers()
+            if marker == "run":
+                self._auto_paused = False
             if marker == "halt":
                 self._flatten_all("HALT")
                 self._consecutive_errors = 0
-            elif marker == "pause":
-                self._consecutive_errors = 0
+                self._stale_cycles = 0
+            frames_ok = False
             try:
-                self._cycle(coins, warm < dry_cycles, paused=marker != "run")
+                frames_ok = self._cycle(coins, warm < dry_cycles, paused=marker != "run")
                 self._consecutive_errors = 0
             except Exception:
                 log.error("Cycle failed:\n%s", traceback.format_exc())
                 self._consecutive_errors += 1
+            # Escalate failures only when there is no operator HALT, and for a
+            # PAUSE only if the bot wrote it itself (operator PAUSE = manual hold).
+            escalating = marker != "halt" and (marker != "pause" or self._auto_paused)
+            if escalating and self.s.is_live():
+                if frames_ok:
+                    self._stale_cycles = 0
+                else:
+                    self._stale_cycles += 1
+                if self._stale_cycles >= self.s.halt_on_stale_cycles:
+                    log.critical("no market data for %d cycles; flattening and halting",
+                                 self._stale_cycles)
+                    self._flatten_all("stale-data")
+                    self._write_marker("HALT")
+                elif self._consecutive_errors >= self.s.flatten_on_errors:
+                    log.critical("%d consecutive cycle failures; flattening and halting",
+                                 self._consecutive_errors)
+                    self._flatten_all("error-flood")
+                    self._write_marker("HALT")
+                elif self._consecutive_errors >= self.s.pause_on_errors:
+                    log.error("%d consecutive cycle failures; pausing new entries",
+                              self._consecutive_errors)
+                    self._auto_paused = True
+                    self._write_marker("PAUSE")
             raised = self.monitor.check(self.risk.state, self.open_positions,
                                         plans=self._last_plans,
-                                        error_rate=min(1.0, self._consecutive_errors),
+                                        error_rate=min(1.0, self._consecutive_errors /
+                                                       max(1, self.s.flatten_on_errors)),
                                         last_event_risk=self._last_event_risk)
-            if self.s.is_live() and self.s.flatten_on_critical and \
+            if marker == "run" and self.s.is_live() and self.s.flatten_on_critical and \
                     any(a["severity"] == "critical" for a in raised):
                 log.critical("CRITICAL monitor alert; flattening all positions and halting")
                 self._flatten_all("critical")
@@ -183,6 +211,7 @@ class TradingBot:
             path.write_text(
                 f"written {dt.datetime.now(dt.timezone.utc).isoformat()}\n",
                 encoding="utf-8")
+            self.store.append_ledger("marker", {"marker": name, "path": str(path)})
             log.warning("wrote marker %s", path)
         except Exception as exc:  # pragma: no cover
             log.error("could not write marker %s: %s", path, exc)
@@ -201,6 +230,8 @@ class TradingBot:
         if not self.open_positions:
             return
         log.critical("FLATTEN all positions (%s)", reason)
+        self.store.append_ledger("flatten", {"reason": reason,
+                                             "positions": list(self.open_positions)})
         for coin in list(self.open_positions.keys()):
             pos = self.open_positions.get(coin)
             if pos is None:
@@ -208,11 +239,78 @@ class TradingBot:
             self._close_position(coin, pos, pos.entry, reason)
         self.risk.state.open_positions = len(self.open_positions)
 
-    def _cycle(self, coins: List[str], warmup: bool = False, paused: bool = False) -> None:
+    def _reconcile_positions(self) -> None:
+        """Reconcile the exchange's position set against the bot's tracking
+        (live only). Orphans on the exchange that the bot never opened are
+        adopted so they get managed + journaled; positions the bot tracks but
+        the exchange no longer holds are dropped with a CRITICAL alert."""
+        if not self.s.is_live():
+            return
+        try:
+            exchange = {p.pair: p for p in self.broker.get_positions()}
+        except Exception as exc:  # pragma: no cover
+            log.error("reconcile: could not fetch exchange positions: %s", exc)
+            return
+        for pair, bp in exchange.items():
+            if any(pos.pair == pair for pos in self.open_positions.values()):
+                continue
+            coin = pair
+            if pair.startswith("B-") and pair.endswith(f"_{self.s.quote}"):
+                coin = pair[2:-len(f"_{self.s.quote}")]
+            elif pair.endswith(self.s.quote):
+                coin = pair[:-len(self.s.quote)]
+            now_ms = int(time.time() * 1000)
+            self.open_positions[coin] = PositionState(
+                coin=coin, pair=pair, side=bp.side, entry=bp.entry_price, qty=bp.quantity,
+                notional=bp.notional, stop_loss=bp.stop_loss or 0.0,
+                take_profit=bp.take_profit or 0.0, entry_time_ms=now_ms,
+                peak_price=bp.entry_price, reason=f"adopted-{now_ms}", confidence=0.0)
+            self.risk.state.open_positions += 1
+            self.monitor.alert("critical", "orphan_position",
+                               f"adopted untracked exchange position {coin} {bp.side} "
+                               f"qty={bp.quantity}")
+            self.store.append_ledger("reconcile_adopt",
+                                     {"coin": coin, "pair": pair, "side": bp.side,
+                                      "qty": bp.quantity, "entry": bp.entry_price})
+        for coin, pos in list(self.open_positions.items()):
+            if pos.pair not in exchange:
+                self.monitor.alert("critical", "ghost_position",
+                                   f"position {coin} tracked by bot but not on exchange")
+                self.store.append_ledger("reconcile_drop", {"coin": coin, "pair": pos.pair})
+                self.open_positions.pop(coin, None)
+                self.risk.state.open_positions = max(0, self.risk.state.open_positions - 1)
+
+    def _verify_tpsl_all(self) -> None:
+        """Re-verify every open position's TP/SL exists on the exchange and
+        re-attach when missing (live only)."""
+        if not self.s.is_live():
+            return
+        for coin, pos in list(self.open_positions.items()):
+            try:
+                bp = self.broker.get_position(pos.pair)
+            except Exception as exc:  # pragma: no cover
+                log.error("tpsl verify %s failed: %s", coin, exc)
+                continue
+            if bp is None:
+                self.monitor.alert("critical", "position_missing",
+                                   f"{coin} not found on exchange")
+                continue
+            if not (bp.stop_loss and bp.take_profit):
+                res = self.broker.set_tpsl(pos.pair, pos.stop_loss, pos.take_profit, pos.qty)
+                if not res.get("ok"):
+                    self.monitor.alert("critical", "tpsl_missing",
+                                       f"{coin} TP/SL not attached: {res.get('error')}")
+                else:
+                    self.store.append_ledger("tpsl_reattach",
+                                             {"coin": coin, "pair": pos.pair,
+                                              "stop_loss": pos.stop_loss,
+                                              "take_profit": pos.take_profit})
+
+    def _cycle(self, coins: List[str], warmup: bool = False, paused: bool = False) -> bool:
         frames = self.feed.get_frames(coins)
         if not frames:
             log.warning("No market data fetched; skipping cycle")
-            return
+            return False
 
         self.portfolio.update_correlation({c: tfs.get("1d") for c, tfs in frames.items()})
 
@@ -245,6 +343,11 @@ class TradingBot:
                 self._scan_entries(frames, event_risk)
 
         self._snapshot(frames)
+        if self.s.reconcile_positions:
+            self._reconcile_positions()
+        if self.s.tpsl_verify:
+            self._verify_tpsl_all()
+        return True
 
     # ------------------------------------------------------------------
     def _scan_entries(self, frames, event_risk) -> None:
@@ -336,6 +439,11 @@ class TradingBot:
             reason=trade_key, confidence=plan.confidence,
         )
         self.risk.state.open_positions += 1
+        self.store.append_ledger("entry",
+                                 {"coin": plan.coin, "pair": plan.pair, "side": plan.side,
+                                  "qty": qty, "entry": entry_price,
+                                  "stop_loss": plan.stop_loss, "take_profit": plan.take_profit,
+                                  "confidence": round(plan.confidence, 4), "rr": round(plan.rr, 3)})
         log.info("OPEN %s %s qty=%.6f entry=%.8f sl=%.8f tp=%.8f conf=%.0f%% rr=%.2f",
                  plan.coin, plan.side.upper(), qty, entry_price, plan.stop_loss,
                  plan.take_profit, plan.confidence * 100, plan.rr)
@@ -372,6 +480,8 @@ class TradingBot:
         if order is None:
             # Exit failed at the broker (live) or no mark price (paper). The
             # position still exists: do NOT record a fill, do NOT forget it.
+            self.store.append_ledger("close_failed",
+                                     {"coin": coin, "pair": pos.pair, "qty": qty})
             log.error("CLOSE FAILED for %s %s - position kept, will retry next cycle",
                       coin, pos.side)
             return
@@ -383,6 +493,10 @@ class TradingBot:
         self.learning.observe("win" if net > 0 else "loss",
                               pos.confidence, 0.5, coin=coin, side=pos.side)
         self.store.record_trade_exit(pos.reason, fill, reason, net, fees)
+        self.store.append_ledger("exit",
+                                 {"coin": coin, "pair": pos.pair, "side": pos.side,
+                                  "qty": qty, "fill": fill, "reason": reason,
+                                  "pnl": round(net, 6), "fees": round(fees, 6)})
         if self.s.learning.get("enabled", True):
             for r in self.store.closed_trades():
                 if r["trade_key"] == pos.reason:

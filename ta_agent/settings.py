@@ -115,6 +115,31 @@ class Settings:
     def pause_file(self) -> Path:
         return Path(self.data_dir) / "PAUSE"
 
+    @property
+    def pause_on_errors(self) -> int:
+        """Consecutive failed cycles before entries are paused (live)."""
+        return int(self.safety.get("pause_on_errors", 5))
+
+    @property
+    def flatten_on_errors(self) -> int:
+        """Consecutive failed cycles before flatten + HALT (live)."""
+        return int(self.safety.get("flatten_on_errors", 12))
+
+    @property
+    def halt_on_stale_cycles(self) -> int:
+        """Consecutive cycles with no market data before flatten + HALT (live)."""
+        return int(self.safety.get("halt_on_stale_cycles", 6))
+
+    @property
+    def reconcile_positions(self) -> bool:
+        """Reconcile exchange positions vs bot tracking each cycle (live)."""
+        return bool(self.safety.get("reconcile_positions", True))
+
+    @property
+    def tpsl_verify(self) -> bool:
+        """Re-verify TP/SL attachment on exchange each cycle (live)."""
+        return bool(self.safety.get("tpsl_verify", True))
+
     def taker_fee(self) -> float:
         if self.market_type == "spot":
             return float(self.fees.get("spot_taker", 0.0010))

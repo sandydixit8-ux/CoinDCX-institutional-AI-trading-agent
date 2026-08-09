@@ -60,6 +60,11 @@
   },
   "safety": {
     "auto_flatten": true,
-    "flatten_on_critical": true
+    "flatten_on_critical": true,
+    "pause_on_errors": 5,
+    "flatten_on_errors": 12,
+    "halt_on_stale_cycles": 6,
+    "reconcile_positions": true,
+    "tpsl_verify": true
   }
 }

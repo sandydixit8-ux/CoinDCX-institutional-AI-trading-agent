@@ -49,21 +49,46 @@ class CoinDCXClient:
         base_url: str = "https://api.coindcx.com",
         timeout: float = 20.0,
         rate_sleep: float = 0.25,
+        retries: int = 3,
+        retry_backoff: float = 1.5,
     ):
         self.api_key = api_key
         self.api_secret = api_secret
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self.rate_sleep = rate_sleep
+        self.retries = retries
+        self.retry_backoff = retry_backoff
         self.session = requests.Session()
         self._markets_details: Optional[List[dict]] = None
 
     # ------------------------------------------------------------------
     # helpers
     # ------------------------------------------------------------------
+    def _request_with_retry(self, do_request) -> "requests.Response":
+        """Retry idempotent GETs on transient failures (timeouts, connection
+        errors, 429/5xx) with exponential backoff. Writes (POST) are never
+        auto-retried to avoid duplicate order placement."""
+        last_exc: Optional[BaseException] = None
+        for attempt in range(self.retries + 1):
+            try:
+                r = do_request()
+                if r.status_code < 500 and r.status_code != 429:
+                    return r
+                last_exc = CoinDCXError(f"HTTP {r.status_code}")
+            except requests.exceptions.RequestException as exc:
+                last_exc = exc
+            if attempt < self.retries:
+                delay = self.retry_backoff * (2 ** attempt)
+                log.warning("CoinDCX GET failed (try %d/%d): %s; retrying in %.1fs",
+                            attempt + 1, self.retries + 1, last_exc, delay)
+                time.sleep(delay)
+        raise last_exc  # type: ignore[misc]
+
     def _get(self, path: str, params: Optional[dict] = None) -> Any:
         url = f"{self.base_url}{path}"
-        r = self.session.get(url, params=params, timeout=self.timeout)
+        r = self._request_with_retry(
+            lambda: self.session.get(url, params=params, timeout=self.timeout))
         if r.status_code >= 400:
             raise CoinDCXError(f"GET {path} -> {r.status_code}: {r.text[:300]}")
         return r.json()
@@ -110,6 +135,24 @@ class CoinDCXClient:
         # JSON body to be sent along with the request; the signature is
         # validated against the received body, so omitting it yields 401.
         r = self.session.get(url, data=payload, headers=headers, timeout=self.timeout)
+        if r.status_code >= 400:
+            raise CoinDCXError(f"GET {path} -> {r.status_code}: {r.text[:300]}")
+        return r.json()
+
+    def _get_signed(self, path: str) -> Any:
+        body = self._signed_body({})
+        payload, signature = self._sign(body)
+        url = f"{self.base_url}{path}"
+        headers = {
+            "Content-Type": "application/json",
+            "X-AUTH-APIKEY": self.api_key,
+            "X-AUTH-SIGNATURE": signature,
+        }
+        # CoinDCX signed GETs (e.g. futures wallet details) require the signed
+        # JSON body to be sent along with the request; the signature is
+        # validated against the received body, so omitting it yields 401.
+        r = self._request_with_retry(
+            lambda: self.session.get(url, data=payload, headers=headers, timeout=self.timeout))
         if r.status_code >= 400:
             raise CoinDCXError(f"GET {path} -> {r.status_code}: {r.text[:300]}")
         return r.json()
