@@ -155,6 +155,82 @@ class TestZeroEquityDrawdown:
                    for a in alerts)
 
 
+class TestKillSwitch:
+    """HALT/PAUSE marker files + flatten-on-critical hardening for live mode."""
+
+    def _bot_with_open_position(self, settings, tmp_path):
+        bot = TradingBot(settings, store_path=tmp_path / "j.db", synthetic=True)
+        bot.broker.mark_prices = {"B-BTC_USDT": 101.0}
+        bot.broker.place_order("B-BTC_USDT", "buy", 0.01, order_type="market_order")
+        bot.open_positions["BTC"] = PositionState(
+            coin="BTC", pair="B-BTC_USDT", side="long", entry=100.0, qty=0.01,
+            notional=1.0, stop_loss=95.0, take_profit=115.0, entry_time_ms=1,
+            peak_price=100.0, reason="BTC-1", confidence=0.9,
+        )
+        bot.risk.state.open_positions = 1
+        return bot
+
+    def test_markers_status(self, settings, tmp_path):
+        bot = TradingBot(settings, store_path=tmp_path / "j.db", synthetic=True)
+        bot.s.data_dir = str(tmp_path)
+        assert bot._check_markers() == "run"
+        (tmp_path / "PAUSE").write_text("x", encoding="utf-8")
+        assert bot._check_markers() == "pause"
+        (tmp_path / "HALT").write_text("x", encoding="utf-8")
+        assert bot._check_markers() == "halt"
+
+    def test_flatten_all_closes_open_positions(self, settings, tmp_path):
+        bot = self._bot_with_open_position(settings, tmp_path)
+        bot._flatten_all("test")
+        assert "BTC" not in bot.open_positions, "flatten must remove the position"
+        assert bot.risk.state.open_positions == 0
+        assert bot.broker.get_positions() == [], "flatten must close at the broker"
+
+    def test_halt_marker_blocks_entries_and_keeps_loop_alive(self, settings, tmp_path, monkeypatch, caplog):
+        bot = TradingBot(settings, store_path=tmp_path / "j.db", synthetic=True)
+        bot.s.data_dir = str(tmp_path)
+        (tmp_path / "HALT").write_text("x", encoding="utf-8")
+        scanned = {"n": 0}
+        bot._scan_entries = lambda *a, **k: scanned.__setitem__("n", scanned["n"] + 1)
+        bot.run(cycles=3, interval_seconds=0, dry_cycles=0)
+        assert scanned["n"] == 0, "HALT must prevent entry scans"
+        assert bot.open_positions == {}
+
+    def test_pause_manages_exits_but_no_entries(self, settings, tmp_path, monkeypatch):
+        bot = self._bot_with_open_position(settings, tmp_path)
+        bot.s.data_dir = str(tmp_path)
+        (tmp_path / "PAUSE").write_text("x", encoding="utf-8")
+        managed = {"n": 0}
+        scanned = {"n": 0}
+        bot._manage_position = lambda *a, **k: managed.__setitem__("n", managed["n"] + 1)
+        bot._scan_entries = lambda *a, **k: scanned.__setitem__("n", scanned["n"] + 1)
+        bot.run(cycles=2, interval_seconds=0, dry_cycles=0)
+        assert managed["n"] > 0, "PAUSE must still manage open positions"
+        assert scanned["n"] == 0, "PAUSE must not scan for entries"
+
+    def test_critical_alert_flattens_and_writes_halt(self, settings, tmp_path, monkeypatch):
+        bot = self._bot_with_open_position(settings, tmp_path)
+        bot.s.mode = "live"
+        bot.s.data_dir = str(tmp_path)
+        bot.monitor = type("M", (), {
+            "check": lambda *a, **k: [{
+                "severity": "critical", "rule": "drawdown_limit",
+                "detail": "dd beyond limit", "ts": 1, "meta": {}}]})()
+        bot.run(cycles=1, interval_seconds=0, dry_cycles=0)
+        assert "BTC" not in bot.open_positions, "critical alert must flatten"
+        assert (tmp_path / "HALT").exists(), "critical alert must write HALT marker"
+
+    def test_paper_mode_does_not_halt_on_critical(self, settings, tmp_path):
+        bot = self._bot_with_open_position(settings, tmp_path)
+        bot.s.data_dir = str(tmp_path)
+        bot.monitor = type("M", (), {
+            "check": lambda *a, **k: [{
+                "severity": "critical", "rule": "drawdown_limit",
+                "detail": "dd beyond limit", "ts": 1, "meta": {}}]})()
+        bot.run(cycles=1, interval_seconds=0, dry_cycles=0)
+        assert not (tmp_path / "HALT").exists(), "paper mode must not self-halt"
+
+
 class TestAvailableCoinsFallback:
     """A transient network failure in available_coins() (a raw CoinDCX HTTP GET
     at the start of every bot loop) must fall back to the watchlist, not crash

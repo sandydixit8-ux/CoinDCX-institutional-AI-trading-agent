@@ -96,16 +96,27 @@ class TradingBot:
         cycle = 0
         warm = 0
         while cycles is None or cycle < cycles:
+            marker = self._check_markers()
+            if marker == "halt":
+                self._flatten_all("HALT")
+                self._consecutive_errors = 0
+            elif marker == "pause":
+                self._consecutive_errors = 0
             try:
-                self._cycle(coins, warm < dry_cycles)
+                self._cycle(coins, warm < dry_cycles, paused=marker != "run")
                 self._consecutive_errors = 0
             except Exception:
                 log.error("Cycle failed:\n%s", traceback.format_exc())
                 self._consecutive_errors += 1
-            self.monitor.check(self.risk.state, self.open_positions,
-                               plans=self._last_plans,
-                               error_rate=min(1.0, self._consecutive_errors),
-                               last_event_risk=self._last_event_risk)
+            raised = self.monitor.check(self.risk.state, self.open_positions,
+                                        plans=self._last_plans,
+                                        error_rate=min(1.0, self._consecutive_errors),
+                                        last_event_risk=self._last_event_risk)
+            if self.s.is_live() and self.s.flatten_on_critical and \
+                    any(a["severity"] == "critical" for a in raised):
+                log.critical("CRITICAL monitor alert; flattening all positions and halting")
+                self._flatten_all("critical")
+                self._write_marker("HALT")
             cycle += 1
             warm += 1
             if on_cycle is not None and report_every and cycle % report_every == 0:
@@ -162,7 +173,42 @@ class TradingBot:
             log.error("ATTENTION %s: TP/SL could not be attached - position is "
                       "UNPROTECTED on the exchange: %s", coin, res.get("error"))
 
-    def _cycle(self, coins: List[str], warmup: bool = False) -> None:
+    def _marker_path(self, name: str) -> Path:
+        return Path(self.s.data_dir) / name
+
+    def _write_marker(self, name: str) -> None:
+        path = self._marker_path(name)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                f"written {dt.datetime.now(dt.timezone.utc).isoformat()}\n",
+                encoding="utf-8")
+            log.warning("wrote marker %s", path)
+        except Exception as exc:  # pragma: no cover
+            log.error("could not write marker %s: %s", path, exc)
+
+    def _check_markers(self) -> str:
+        """Return 'halt' (flatten + stop trading), 'pause' (manage exits only)
+        or 'run'. Markers live in the data directory so an operator can flip
+        them without restarting the daemon."""
+        if self._marker_path("HALT").exists():
+            return "halt"
+        if self._marker_path("PAUSE").exists():
+            return "pause"
+        return "run"
+
+    def _flatten_all(self, reason: str) -> None:
+        if not self.open_positions:
+            return
+        log.critical("FLATTEN all positions (%s)", reason)
+        for coin in list(self.open_positions.keys()):
+            pos = self.open_positions.get(coin)
+            if pos is None:
+                continue
+            self._close_position(coin, pos, pos.entry, reason)
+        self.risk.state.open_positions = len(self.open_positions)
+
+    def _cycle(self, coins: List[str], warmup: bool = False, paused: bool = False) -> None:
         frames = self.feed.get_frames(coins)
         if not frames:
             log.warning("No market data fetched; skipping cycle")
@@ -189,7 +235,7 @@ class TradingBot:
             self._manage_position(coin, frames[coin], event_risk)
 
         # ---- look for entries -------------------------------------------
-        if not warmup:
+        if not warmup and not paused:
             blocked = self.risk.can_open()
             if blocked:
                 log.info("Entries blocked: %s", blocked)

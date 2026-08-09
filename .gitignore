@@ -19,6 +19,9 @@ data/live_report.json
 data/validation_report.json
 data/learning_report.json
 data/reports/
+data/practice_*/reports/
+data/practice_*/*.log
+data/practice_*/*.db*
 
 journal.db
 

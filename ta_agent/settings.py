@@ -59,6 +59,7 @@ class Settings:
     news: dict = field(default_factory=dict)
     learning: dict = field(default_factory=dict)
     backtest: dict = field(default_factory=dict)
+    safety: dict = field(default_factory=dict)
     api_key: str = ""
     api_secret: str = ""
     base_url: str = "https://api.coindcx.com"
@@ -95,6 +96,24 @@ class Settings:
     @property
     def max_positions(self) -> int:
         return int(self.risk.get("max_positions", 5))
+
+    @property
+    def auto_flatten(self) -> bool:
+        """Flatten all open positions when a HALT marker is present."""
+        return bool(self.safety.get("auto_flatten", True))
+
+    @property
+    def flatten_on_critical(self) -> bool:
+        """Flatten + write a HALT marker when the monitor raises a CRITICAL alert."""
+        return bool(self.safety.get("flatten_on_critical", True))
+
+    @property
+    def halt_file(self) -> Path:
+        return Path(self.data_dir) / "HALT"
+
+    @property
+    def pause_file(self) -> Path:
+        return Path(self.data_dir) / "PAUSE"
 
     def taker_fee(self) -> float:
         if self.market_type == "spot":
@@ -150,6 +169,7 @@ class Settings:
             news=dict(cfg.get("news", {})),
             learning=dict(cfg.get("learning", {})),
             backtest=dict(cfg.get("backtest", {})),
+            safety=dict(cfg.get("safety", {})),
             api_key=api_key,
             api_secret=api_secret,
             data_dir=str(data_dir),

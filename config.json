@@ -57,5 +57,9 @@
     "end": null,
     "initial_capital": 10000.0,
     "bars": 1500
+  },
+  "safety": {
+    "auto_flatten": true,
+    "flatten_on_critical": true
   }
 }
